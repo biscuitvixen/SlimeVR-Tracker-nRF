@@ -4,6 +4,11 @@ name: Build & Release (XIAO + custom overlay)
 # boards/xiao_ble.overlay layered on top, then publishes the resulting UF2
 # as a GitHub Release on this fork.
 #
+# A daily `check` job compares upstream HEAD against the SHA embedded in the
+# latest release tag (xiao-<date>-<sha>) and skips the whole build when
+# upstream hasn't moved, so releases only appear when there is something new
+# to build. `workflow_dispatch` bypasses the check and always builds.
+#
 # Strategy: "overwrite-on-build" — we clone pristine upstream `main`, drop our
 # overlay file over it, and build. There is never a git merge/rebase here, so
 # this can never hit a merge conflict. If upstream changes the board in a way
@@ -11,9 +16,12 @@ name: Build & Release (XIAO + custom overlay)
 
 on:
   schedule:
-    # Mondays 06:00 UTC. NOTE: GitHub only runs `schedule` from the repo's
-    # DEFAULT branch, which is why this workflow lives on the default branch.
-    - cron: "0 6 * * 1"
+    # Daily 11:00 UTC - midday UK in summer, 11:00 in winter (cron can't
+    # follow DST), so releases land while someone is awake to notice them.
+    # The `check` job makes no-change runs cost seconds, so polling daily is
+    # cheap. NOTE: GitHub only runs `schedule` from the repo's DEFAULT branch,
+    # which is why this workflow lives on the default branch.
+    - cron: "0 11 * * *"
   workflow_dispatch:
 
 permissions:
@@ -31,7 +39,42 @@ env:
   OUT_NAME: SlimeNRF_XIAO_Tracker
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+      sha: ${{ steps.gate.outputs.sha }}
+    steps:
+      - name: 🕵️ Compare upstream HEAD with last release
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          SHA=$(git ls-remote "$UPSTREAM_URL" "refs/heads/$UPSTREAM_BRANCH" | cut -c1-7)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          # Latest release tag looks like xiao-<date>-<sha>; the suffix is the
+          # upstream SHA that release was built from.
+          LAST_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+          LAST_SHA="${LAST_TAG##*-}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "🔧 Manual run - building regardless of upstream state."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SHA" = "$LAST_SHA" ]; then
+            echo "✅ Upstream $UPSTREAM_BRANCH still at $SHA (last release: ${LAST_TAG:-none}). Nothing to build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "🆕 Upstream moved: $LAST_SHA -> $SHA. Building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-release:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
 
@@ -78,8 +121,9 @@ jobs:
       - name: 🏷️ Capture upstream version
         id: ver
         run: |
-          cd zephyr-workspace/SlimeNRF-CI
-          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          # Reuse the SHA the check job saw, not a fresh rev-parse: if upstream
+          # moves mid-build, the tag should still match what was built.
+          echo "sha=${{ needs.check.outputs.sha }}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
       - name: ♻️ Initialize Zephyr workspace (upstream west.yml)
