@@ -2,8 +2,8 @@ name: Sync with upstream
 
 # Daily (and on-demand) check for new commits on upstream
 # SlimeVR-Tracker-nRF `main`. When upstream is ahead, this merges upstream into
-# a `sync/upstream-<date>` branch and opens a PR against this fork's default
-# branch, so the changes can be reviewed before landing.
+# the `sync/upstream` branch and opens (or refreshes) a PR against this fork's
+# default branch, so the changes can be reviewed before landing.
 #
 # The release pipeline (release.yml) clones upstream fresh on every run, so
 # firmware releases keep working even if a sync PR is left unmerged. This
@@ -38,6 +38,10 @@ jobs:
       - name: 🔄 Merge upstream and open PR
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh resolves its target repository from git remote names and
+          # prefers one called "upstream" over "origin". Pin it to this fork
+          # so the PR can never be opened against SlimeVR's repository.
+          GH_REPO: ${{ github.repository }}
           BASE: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
@@ -45,27 +49,32 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git remote add upstream "$UPSTREAM_URL"
-          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          # Remote name deliberately avoids "upstream", which gh special-cases.
+          git remote add slimevr "$UPSTREAM_URL"
+          git fetch --no-tags slimevr "$UPSTREAM_BRANCH"
 
           # Nothing to do if upstream is already an ancestor of our base branch.
-          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
-            echo "✅ Already up to date with upstream/$UPSTREAM_BRANCH."
+          if git merge-base --is-ancestor "slimevr/$UPSTREAM_BRANCH" HEAD; then
+            echo "✅ Already up to date with slimevr/$UPSTREAM_BRANCH."
             exit 0
           fi
 
-          SYNC_BRANCH="sync/upstream-$(date -u +%Y%m%d)"
+          # One fixed branch: a re-run replaces it and updates the open PR
+          # rather than leaving a dated branch behind after every attempt.
+          SYNC_BRANCH="sync/upstream"
           git checkout -B "$SYNC_BRANCH"
 
           # Attempt the merge. The only realistic conflict is boards/xiao_ble.overlay.
-          if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+          if ! git merge --no-edit "slimevr/$UPSTREAM_BRANCH"; then
             git merge --abort
             echo "::error::Upstream merge has conflicts (likely boards/xiao_ble.overlay)."
             echo "::error::Resolve manually: git fetch upstream && git merge upstream/$UPSTREAM_BRANCH"
             exit 1
           fi
 
-          git push --force-with-lease origin "$SYNC_BRANCH"
+          # The branch is bot-owned and rebuilt from scratch each run, so a
+          # plain overwrite is the intended behaviour.
+          git push --force origin "$SYNC_BRANCH"
 
           TITLE="Sync with upstream ($(date -u +%Y-%m-%d))"
           BODY="Automated upstream sync: merges \`upstream/${UPSTREAM_BRANCH}\` into \`${BASE}\`.
