@@ -7,7 +7,10 @@ name: Build & Release (XIAO + custom overlay)
 # A daily `check` job compares upstream HEAD against the SHA embedded in the
 # latest release tag (xiao-<date>-<sha>) and skips the whole build when
 # upstream hasn't moved, so releases only appear when there is something new
-# to build. `workflow_dispatch` bypasses the check and always builds.
+# to build. A build that fails leaves an `attempted-<sha>` tag behind so the
+# same broken upstream commit is not retried every day; the tag is removed
+# once a release for a newer commit succeeds. `workflow_dispatch` bypasses
+# both checks and always builds.
 #
 # Strategy: "overwrite-on-build" — we clone pristine upstream `main`, drop our
 # overlay file over it, and build. There is never a git merge/rebase here, so
@@ -61,16 +64,42 @@ jobs:
           LAST_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
           LAST_SHA="${LAST_TAG##*-}"
 
+          # A previous run that failed on this exact upstream commit leaves
+          # an attempted-<sha> tag; there is no point rebuilding it daily.
+          ATTEMPTED=$(gh api "repos/$GH_REPO/git/ref/tags/attempted-$SHA" -q .ref 2>/dev/null || true)
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "🔧 Manual run - building regardless of upstream state."
             echo "build=true" >> "$GITHUB_OUTPUT"
           elif [ "$SHA" = "$LAST_SHA" ]; then
             echo "✅ Upstream $UPSTREAM_BRANCH still at $SHA (last release: ${LAST_TAG:-none}). Nothing to build."
             echo "build=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$ATTEMPTED" ]; then
+            echo "⏭️ Upstream $UPSTREAM_BRANCH at $SHA already failed to build once. Waiting for upstream to move."
+            echo "build=false" >> "$GITHUB_OUTPUT"
           else
             echo "🆕 Upstream moved: $LAST_SHA -> $SHA. Building."
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: 🏷️ Mark upstream commit as attempted
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The tag points at this fork's own HEAD; the upstream SHA lives in
+          # the tag name. Older markers are dropped so only the most recent
+          # attempt is ever recorded.
+          gh api "repos/$GH_REPO/git/matching-refs/tags/attempted-" -q '.[].ref' \
+            | while read -r ref; do
+                gh api -X DELETE "repos/$GH_REPO/git/${ref#refs/}" || true
+              done
+          gh api "repos/$GH_REPO/git/refs" \
+            -f ref="refs/tags/attempted-$SHA" -f sha="${{ github.sha }}" >/dev/null
+          echo "Marked attempted-$SHA"
 
   build-release:
     needs: check
@@ -117,6 +146,26 @@ jobs:
              zephyr-workspace/SlimeNRF-CI/boards/xiao_ble.overlay
           echo "Overlay applied. Diff vs upstream:"
           git -C zephyr-workspace/SlimeNRF-CI --no-pager diff -- boards/xiao_ble.overlay || true
+
+      - name: 🩹 Patch upstream build break (temporary)
+        # Upstream PR #159 renamed the IMU ext_passthrough hook to ext_setup
+        # with three parameters but left two callers in the direct-mag path
+        # untouched, so any board with a `mag` devicetree node fails to
+        # compile. The extra arguments are ignored in passthrough mode. Both
+        # edits are no-ops once upstream fixes the callers, at which point
+        # this step prints nothing and can be deleted.
+        run: |
+          set -euo pipefail
+          F=zephyr-workspace/SlimeNRF-CI/src/sensor/sensor.c
+          sed -i \
+            -e 's/sensor_imu->ext_passthrough(SENSOR_EXT_MODE_I2C_PASSTHROUGH)/sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH, NULL, 0)/' \
+            -e 's/sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH, NULL);/sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH, NULL, 0);/' \
+            "$F"
+          if git -C zephyr-workspace/SlimeNRF-CI diff --quiet -- src/sensor/sensor.c; then
+            echo "::notice::sensor.c patch no longer applies - upstream has fixed it, remove this step."
+          else
+            git -C zephyr-workspace/SlimeNRF-CI --no-pager diff -- src/sensor/sensor.c
+          fi
 
       - name: 🏷️ Capture upstream version
         id: ver
@@ -167,3 +216,12 @@ jobs:
             Flash `${{ env.OUT_NAME }}.uf2` by double-tapping reset and copying it to the `XIAO-SENSE`/`XIAO` mass-storage volume.
           files: zephyr-workspace/${{ env.OUT_NAME }}.uf2
           fail_on_unmatched_files: true
+
+      - name: 🧽 Drop attempted marker
+        # The release now records this upstream SHA, so the marker is
+        # redundant; only failed attempts leave one behind.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/attempted-${{ needs.check.outputs.sha }}" || true
